@@ -235,7 +235,7 @@ def switch_model(model_name: str, user_id: str = Depends(verify_token)):
 # ---- /chat endpoint was removed ----
 
 
-# Key: REMOVED_OPENAI_KEY
+
 # List all models for the user
 @app.get("/models")
 def get_models(user_id: str = Depends(verify_token)):
