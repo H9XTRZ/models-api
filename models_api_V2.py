@@ -20,7 +20,10 @@ security = HTTPBearer()
 
 DB_PATH = "models_data.db"
 
-SECRET_KEY = os.getenv("SECRET_KEY  ")
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("❌ SECRET_KEY is missing from environment variables.")
+
 
 # --- Encryption/Decryption for OpenAI Key (for browser backend) ---
 raw_encryption_key = os.getenv("ENCRYPTION_KEY")
