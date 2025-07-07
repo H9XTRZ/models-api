@@ -91,6 +91,12 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS devices (
     callback_url TEXT,
     PRIMARY KEY (email, device_token)
 )""")
+cursor.execute("""CREATE TABLE IF NOT EXISTS extensions (
+    email TEXT,
+    command_name TEXT,
+    extension_code TEXT,
+    PRIMARY KEY (email, command_name)
+)""")
 conn.commit()
 
 # Models
@@ -116,6 +122,14 @@ class ModelCreate(BaseModel):
 
 class ModelChat(BaseModel):
     message: str
+
+# --- Extension management models ---
+class ExtensionUpload(BaseModel):
+    command_name: str
+    extension_code: str
+
+class ExtensionCodeRequest(BaseModel):
+    command_name: str
 
 # Device registration request model
 class DeviceRegistration(BaseModel):
@@ -370,3 +384,28 @@ def get_synced_messages(user_id: str = Depends(verify_token)):
     if not model:
         raise HTTPException(status_code=404, detail="Model data missing.")
     return {"messages": model[0]}
+
+
+# --- Extension Management Endpoints ---
+
+@app.post("/upload_extension")
+def upload_extension(req: ExtensionUpload, user_id: str = Depends(verify_token)):
+    cursor.execute("REPLACE INTO extensions (email, command_name, extension_code) VALUES (?, ?, ?)",
+                   (user_id, req.command_name, req.extension_code))
+    conn.commit()
+    return {"status": f"Extension '{req.command_name}' uploaded successfully."}
+
+@app.get("/get_user_extensions")
+def get_user_extensions(user_id: str = Depends(verify_token)):
+    cursor.execute("SELECT command_name FROM extensions WHERE email = ?", (user_id,))
+    extensions = [row[0] for row in cursor.fetchall()]
+    return {"extensions": extensions}
+
+@app.post("/get_extension_code")
+def get_extension_code(req: ExtensionCodeRequest, user_id: str = Depends(verify_token)):
+    cursor.execute("SELECT extension_code FROM extensions WHERE email = ? AND command_name = ?",
+                   (user_id, req.command_name))
+    row = cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Extension not found")
+    return {"extension_code": row[0]}
