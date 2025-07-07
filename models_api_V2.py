@@ -409,3 +409,4 @@ def get_extension_code(req: ExtensionCodeRequest, user_id: str = Depends(verify_
     if not row:
         raise HTTPException(status_code=404, detail="Extension not found")
     return {"extension_code": row[0]}
+#again
