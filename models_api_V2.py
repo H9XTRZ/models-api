@@ -273,12 +273,40 @@ def get_model_state(user_id: str = Depends(verify_token)):
     if not row:
         raise HTTPException(status_code=404, detail="No current model set.")
     model_name = row[0]
-    cursor.execute("SELECT init_prompt, messages FROM models WHERE email = ? AND model_name = ?", (user_id, model_name))
+
+    # Fetch model init_prompt and messages
+    cursor.execute(
+        "SELECT init_prompt, messages FROM models WHERE email = ? AND model_name = ?",
+        (user_id, model_name)
+    )
     model = cursor.fetchone()
     if not model:
         raise HTTPException(status_code=404, detail="Model data missing.")
-    return {"model_name": model_name , "init_prompt": model[0]}   # add this to it to get the init prompt and chat history for the current model: , "init_prompt": model[0], "messages": model[1]
+    init_prompt = model[0]
+    messages = model[1]
 
+    # Fetch theme colors for this model (if any)
+    cursor.execute(
+        "SELECT background, e1, e2, e3, e4 FROM model_themes WHERE email = ? AND model_name = ?",
+        (user_id, model_name)
+    )
+    theme_row = cursor.fetchone()
+    theme = None
+    if theme_row:
+        theme = {
+            "background": theme_row[0],
+            "e1": theme_row[1],
+            "e2": theme_row[2],
+            "e3": theme_row[3],
+            "e4": theme_row[4],
+        }
+
+    return {
+        "model_name": model_name,
+        "init_prompt": init_prompt,
+        "messages": messages,
+        "theme": theme,  # None if no theme saved yet
+    }
 # Delete a model
 # Delete a model
 @app.delete("/delete_model")
