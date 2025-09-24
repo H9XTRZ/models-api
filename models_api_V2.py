@@ -90,11 +90,16 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS devices (
     device_token TEXT,
     device_name TEXT,
     callback_url TEXT,
+    port TEXT,
     PRIMARY KEY (email, device_token)
 )""")
-# Ensure legacy tables gain the new column without manual migration.
+# Ensure legacy tables gain the new columns without manual migration.
 try:
     cursor.execute("ALTER TABLE devices ADD COLUMN device_name TEXT")
+except sqlite3.OperationalError:
+    pass
+try:
+    cursor.execute("ALTER TABLE devices ADD COLUMN port TEXT")
 except sqlite3.OperationalError:
     pass
 cursor.execute("""CREATE TABLE IF NOT EXISTS extensions (
@@ -141,7 +146,17 @@ class ExtensionCodeRequest(BaseModel):
 class DeviceRegistration(BaseModel):
     device_token: str
     device_name: str
-    callback_url: str
+    port: str
+    callback_url: str | None = None
+
+
+class DeviceTokenRequest(BaseModel):
+    device_token: str
+
+
+class DeviceRenameRequest(BaseModel):
+    device_token: str
+    device_name: str
 
 
 def create_refresh_token(email: str):
@@ -359,20 +374,48 @@ def get_encrypted_openai_key(req: EncryptedKeyRequest):
 # Device registration endpoint
 @app.post("/register_device")
 def register_device(req: DeviceRegistration, user_id: str = Depends(verify_token)):
+    cursor.execute("SELECT 1 FROM devices WHERE email = ? AND device_token = ?", (user_id, req.device_token))
+    if cursor.fetchone():
+        raise HTTPException(status_code=409, detail="Device token already registered for this user.")
     cursor.execute(
-        "REPLACE INTO devices (email, device_token, device_name, callback_url) VALUES (?, ?, ?, ?)",
-        (user_id, req.device_token, req.device_name, req.callback_url)
+        "INSERT INTO devices (email, device_token, device_name, callback_url, port) VALUES (?, ?, ?, ?, ?)",
+        (user_id, req.device_token, req.device_name, req.callback_url, req.port)
     )
     conn.commit()
     return {"status": "Device registered successfully"}
 
 
+@app.post("/unregister_device")
+def unregister_device(req: DeviceTokenRequest, user_id: str = Depends(verify_token)):
+    cursor.execute("DELETE FROM devices WHERE email = ? AND device_token = ?", (user_id, req.device_token))
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Device not found for this user.")
+    conn.commit()
+    return {"status": "Device unregistered successfully"}
+
+
+@app.post("/rename_device")
+def rename_device(req: DeviceRenameRequest, user_id: str = Depends(verify_token)):
+    cursor.execute(
+        "UPDATE devices SET device_name = ? WHERE email = ? AND device_token = ?",
+        (req.device_name, user_id, req.device_token)
+    )
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Device not found for this user.")
+    conn.commit()
+    return {"status": "Device renamed successfully"}
+
+
 @app.get("/get_registered_devices")
 def get_registered_devices(user_id: str = Depends(verify_token)):
-    cursor.execute("SELECT device_name, device_token FROM devices WHERE email = ?", (user_id,))
+    cursor.execute("SELECT device_token, device_name, port FROM devices WHERE email = ?", (user_id,))
     rows = cursor.fetchall()
-    device_names = [name if name else token for name, token in rows]
-    return {"devices": device_names}
+    devices = {token: (name if name else token) for token, name, _ in rows}
+    device_ports = {token: port for token, _, port in rows if port}
+    response = {"devices": devices}
+    if device_ports:
+        response["device_ports"] = device_ports
+    return response
 
 
 
