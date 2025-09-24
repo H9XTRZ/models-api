@@ -88,9 +88,15 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS model_themes (
 cursor.execute("""CREATE TABLE IF NOT EXISTS devices (
     email TEXT,
     device_token TEXT,
+    device_name TEXT,
     callback_url TEXT,
     PRIMARY KEY (email, device_token)
 )""")
+# Ensure legacy tables gain the new column without manual migration.
+try:
+    cursor.execute("ALTER TABLE devices ADD COLUMN device_name TEXT")
+except sqlite3.OperationalError:
+    pass
 cursor.execute("""CREATE TABLE IF NOT EXISTS extensions (
     email TEXT,
     command_name TEXT,
@@ -134,6 +140,7 @@ class ExtensionCodeRequest(BaseModel):
 # Device registration request model
 class DeviceRegistration(BaseModel):
     device_token: str
+    device_name: str
     callback_url: str
 
 
@@ -213,7 +220,7 @@ def update_memory(req: MemoryUpdate, user_id: str = Depends(verify_token)):
     existing = cursor.fetchone()
     existing_memory = existing[0] if existing and existing[0] else ""
     if not existing_memory.startswith("SYSTEM RESPONSE: You have entered the MEMORY DATABASE"):
-        header = "SYSTEM RESPONSE: You have entered the MEMORY DATABASE\nYou have entered the MEMORY DATABASE.\nHere are all the memories currently saved with the user.\nEach memory is separated by * — this marks the end of one and the start of another.\n----\n"
+        header = "SYSTEM RESPONSE: Here are all the memories currently saved with the user.\nEach memory is separated by * — this marks the end of one and the start of another.\n----\n"
     else:
         header = ""
     updated_memory = existing_memory + req.memory.strip() + "   *\n"
@@ -352,9 +359,20 @@ def get_encrypted_openai_key(req: EncryptedKeyRequest):
 # Device registration endpoint
 @app.post("/register_device")
 def register_device(req: DeviceRegistration, user_id: str = Depends(verify_token)):
-    cursor.execute("REPLACE INTO devices (email, device_token, callback_url) VALUES (?, ?, ?)", (user_id, req.device_token, req.callback_url))
+    cursor.execute(
+        "REPLACE INTO devices (email, device_token, device_name, callback_url) VALUES (?, ?, ?, ?)",
+        (user_id, req.device_token, req.device_name, req.callback_url)
+    )
     conn.commit()
     return {"status": "Device registered successfully"}
+
+
+@app.get("/get_registered_devices")
+def get_registered_devices(user_id: str = Depends(verify_token)):
+    cursor.execute("SELECT device_name, device_token FROM devices WHERE email = ?", (user_id,))
+    rows = cursor.fetchall()
+    device_names = [name if name else token for name, token in rows]
+    return {"devices": device_names}
 
 
 
