@@ -36,6 +36,14 @@ HARDCODED_BROWSER_USE_PASSWORD = "#Oh,whenitall,itallfallsdownYeah,thistherealon
 
 ENCRYPTED_OPENAI_KEY = fernet.encrypt(os.getenv("OPENAI_API_KEY").encode())
 
+raw_admin_emails = os.getenv("ADMIN_EMAILS", "")
+ADMIN_EMAILS = {email.strip() for email in raw_admin_emails.split(",") if email.strip()}
+
+
+def ensure_admin(user_email: str) -> None:
+    if ADMIN_EMAILS and user_email not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Admin privileges required for this action.")
+
 # Initialize DB
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
@@ -82,7 +90,17 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS model_themes (
     e2 TEXT,
     e3 TEXT,
     e4 TEXT,
+    voice_id TEXT,
     PRIMARY KEY (email, model_name)
+)""")
+# Voice catalog shared across models
+cursor.execute("""CREATE TABLE IF NOT EXISTS voices (
+    name TEXT PRIMARY KEY,
+    voice_id TEXT NOT NULL UNIQUE,
+    description TEXT,
+    accent TEXT,
+    language TEXT,
+    gender TEXT
 )""")
 # Device registration table
 cursor.execute("""CREATE TABLE IF NOT EXISTS devices (
@@ -100,6 +118,14 @@ except sqlite3.OperationalError:
     pass
 try:
     cursor.execute("ALTER TABLE devices ADD COLUMN port TEXT")
+except sqlite3.OperationalError:
+    pass
+try:
+    cursor.execute("ALTER TABLE model_themes ADD COLUMN voice_id TEXT")
+except sqlite3.OperationalError:
+    pass
+try:
+    cursor.execute("ALTER TABLE voices ADD COLUMN gender TEXT")
 except sqlite3.OperationalError:
     pass
 cursor.execute("""CREATE TABLE IF NOT EXISTS extensions (
@@ -130,6 +156,7 @@ class ModelCreate(BaseModel):
     e2: str = None
     e3: str = None
     e4: str = None
+    voice_id: str | None = None
 
 class ModelChat(BaseModel):
     message: str
@@ -157,6 +184,20 @@ class DeviceTokenRequest(BaseModel):
 class DeviceRenameRequest(BaseModel):
     device_token: str
     device_name: str
+
+
+class VoiceRegistration(BaseModel):
+    name: str
+    voice_id: str
+    description: str | None = None
+    accent: str | None = None
+    language: str | None = None
+    gender: str | None = None
+
+
+class VoiceDeleteRequest(BaseModel):
+    name: str | None = None
+    delete_all: bool = False
 
 
 def create_refresh_token(email: str):
@@ -256,12 +297,30 @@ def create_model(req: ModelCreate, user_id: str = Depends(verify_token)):
                    (user_id, req.model_name, req.init_prompt, "[]"))
     cursor.execute("INSERT OR REPLACE INTO current_model (email, model_name) VALUES (?, ?)", (user_id, req.model_name))
 
-    # Insert theme colors if all are provided
-    if all([req.background, req.e1, req.e2, req.e3, req.e4]):
-        cursor.execute("""INSERT OR REPLACE INTO model_themes 
-            (email, model_name, background, e1, e2, e3, e4) 
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (user_id, req.model_name, req.background, req.e1, req.e2, req.e3, req.e4))
+    theme_values = (
+        req.background,
+        req.e1,
+        req.e2,
+        req.e3,
+        req.e4,
+        req.voice_id,
+    )
+    if any(theme_values):
+        cursor.execute(
+            """INSERT OR REPLACE INTO model_themes 
+            (email, model_name, background, e1, e2, e3, e4, voice_id) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                user_id,
+                req.model_name,
+                req.background,
+                req.e1,
+                req.e2,
+                req.e3,
+                req.e4,
+                req.voice_id,
+            ),
+        )
 
     conn.commit()
     return {"status": f"Model '{req.model_name}' created and activated."}
@@ -309,12 +368,12 @@ def get_model_state(user_id: str = Depends(verify_token)):
 
     # Fetch theme colors for this model (if any)
     cursor.execute(
-        "SELECT background, e1, e2, e3, e4 FROM model_themes WHERE email = ? AND model_name = ?",
+        "SELECT background, e1, e2, e3, e4, voice_id FROM model_themes WHERE email = ? AND model_name = ?",
         (user_id, model_name)
     )
     theme_row = cursor.fetchone()
     theme = None
-    if theme_row:
+    if theme_row and any(theme_row):
         theme = {
             "background": theme_row[0],
             "e1": theme_row[1],
@@ -322,6 +381,9 @@ def get_model_state(user_id: str = Depends(verify_token)):
             "e3": theme_row[3],
             "e4": theme_row[4],
         }
+        voice_id = theme_row[5]
+        if voice_id:
+            theme["voice"] = voice_id
 
     return {
         "model_name": model_name,
@@ -337,6 +399,50 @@ def delete_model(model_name: str, user_id: str = Depends(verify_token)):
     cursor.execute("DELETE FROM current_model WHERE email = ? AND model_name = ?", (user_id, model_name))
     conn.commit()
     return {"status": f"Model '{model_name}' deleted."}
+
+
+@app.get("/voices")
+def list_voices(user_id: str = Depends(verify_token)):
+    cursor.execute("SELECT name, voice_id, description, accent, language, gender FROM voices ORDER BY name")
+    voices = [
+        {
+            "name": row[0],
+            "voice_id": row[1],
+            "description": row[2],
+            "accent": row[3],
+            "language": row[4],
+            "gender": row[5],
+        }
+        for row in cursor.fetchall()
+    ]
+    return {"voices": voices}
+
+
+@app.post("/admin/voices")
+def register_voice(req: VoiceRegistration, user_id: str = Depends(verify_token)):
+    ensure_admin(user_id)
+    cursor.execute(
+        "INSERT OR REPLACE INTO voices (name, voice_id, description, accent, language, gender) VALUES (?, ?, ?, ?, ?, ?)",
+        (req.name, req.voice_id, req.description, req.accent, req.language, req.gender),
+    )
+    conn.commit()
+    return {"status": f"Voice '{req.name}' registered."}
+
+
+@app.delete("/admin/voices")
+def delete_voice(req: VoiceDeleteRequest, user_id: str = Depends(verify_token)):
+    ensure_admin(user_id)
+    if req.delete_all:
+        cursor.execute("DELETE FROM voices")
+        conn.commit()
+        return {"status": "All voices removed."}
+    if not req.name:
+        raise HTTPException(status_code=400, detail="Provide a voice name to remove or set delete_all to true.")
+    cursor.execute("DELETE FROM voices WHERE name = ?", (req.name,))
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Voice not found.")
+    conn.commit()
+    return {"status": f"Voice '{req.name}' removed."}
 
 # Get theme colors for a specific model
 @app.get("/get_theme")
