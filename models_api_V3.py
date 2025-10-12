@@ -761,7 +761,11 @@ def get_context(req: ContextRequest, user_id: str = Depends(verify_token)):
     )
     row = cursor.fetchone()
     if not row:
-        raise HTTPException(status_code=404, detail="Model not found.")
+        return {
+            "model": model_name,
+            "context_length": req.context_length,
+            "messages": [],
+        }
 
     stored_messages = _deserialize_stored_messages(row[0])
     normalized_messages, changed = _normalize_messages(stored_messages)
