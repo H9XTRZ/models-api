@@ -19,7 +19,6 @@ import time as t
 from dotenv import load_dotenv
 import os
 load_dotenv()
-
 app = FastAPI()
 
 security = HTTPBearer()
