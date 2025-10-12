@@ -752,7 +752,9 @@ class ContextRequest(BaseModel):
         allow_population_by_field_name = True
 
 
+# Allow both `/get_context` and `/get_context/`
 @app.post("/get_context")
+@app.post("/get_context/")
 def get_context(req: ContextRequest, user_id: str = Depends(verify_token)):
     model_name = req.model_name
     cursor.execute(
