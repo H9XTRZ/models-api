@@ -1,8 +1,14 @@
 from cryptography.fernet import Fernet
 from fastapi import Request
 from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+import json
+import math
+import re
 import uuid, sqlite3
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from typing import Any
 import bcrypt
 import jwt
 import time
@@ -13,7 +19,6 @@ import time as t
 from dotenv import load_dotenv
 import os
 load_dotenv()
-
 app = FastAPI()
 
 security = HTTPBearer()
@@ -550,9 +555,159 @@ def get_engine_port(device_token: str, user_id: str = Depends(verify_token)):
     return {"tunnel_url": row[0]}
 # ---- Message Sync Endpoints ----
 
+
+def _coerce_message_list(payload: list[dict[str, Any]] | str) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [msg for msg in payload if isinstance(msg, dict)]
+    if isinstance(payload, str):
+        if not payload.strip():
+            return []
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Messages payload must be a JSON array.") from exc
+        if isinstance(data, list):
+            return [msg for msg in data if isinstance(msg, dict)]
+    raise HTTPException(status_code=400, detail="Messages payload must be a list or JSON string.")
+
+
+def _deserialize_stored_messages(raw: Any) -> list[dict[str, Any]]:
+    if raw in (None, "", "null"):
+        return []
+    if isinstance(raw, list):
+        source = raw
+    elif isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        source = parsed if isinstance(parsed, list) else []
+    else:
+        return []
+    return [msg for msg in source if isinstance(msg, dict)]
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if candidate.endswith("Z"):
+            candidate = candidate[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _normalize_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    normalized: list[dict[str, Any]] = []
+    changed = False
+    now = datetime.now(timezone.utc)
+    fallback_index = 0
+
+    for message in messages:
+        if not isinstance(message, dict):
+            changed = True
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role is None or content is None:
+            changed = True
+            continue
+        timestamp = _parse_timestamp(message.get("timestamp"))
+        if timestamp is None:
+            timestamp = now + timedelta(milliseconds=fallback_index)
+            fallback_index += 1
+            changed = True
+        canonical_ts = timestamp.astimezone(timezone.utc).isoformat()
+        if message.get("timestamp") != canonical_ts:
+            changed = True
+        entry = dict(message)
+        entry["timestamp"] = canonical_ts
+        normalized.append(entry)
+    return normalized, changed
+
+
+def _serialize_messages(messages: list[dict[str, Any]]) -> str:
+    return json.dumps(messages, ensure_ascii=False)
+
+
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r"\w+", text.lower())
+
+
+def _vectorize(text: str) -> Counter:
+    return Counter(_tokenize(text))
+
+
+def _cosine_similarity(vec_a: Counter, vec_b: Counter) -> float:
+    if not vec_a or not vec_b:
+        return 0.0
+    intersection = set(vec_a.keys()) & set(vec_b.keys())
+    dot_product = sum(vec_a[token] * vec_b[token] for token in intersection)
+    magnitude_a = math.sqrt(sum(count * count for count in vec_a.values()))
+    magnitude_b = math.sqrt(sum(count * count for count in vec_b.values()))
+    if magnitude_a == 0 or magnitude_b == 0:
+        return 0.0
+    return dot_product / (magnitude_a * magnitude_b)
+
+
+def _context_cutoff(length: str) -> datetime:
+    if not length:
+        raise HTTPException(status_code=400, detail="context_length is required.")
+    value = length.strip().lower()
+    if value == "all":
+        return datetime.min.replace(tzinfo=timezone.utc)
+    match = re.fullmatch(r"(\d+)\s*([smhdwmy])", value)
+    if not match:
+        raise HTTPException(status_code=400, detail="context_length must follow format like '1m' or '2w'.")
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if amount < 0:
+        raise HTTPException(status_code=400, detail="context_length value must be positive.")
+    if unit == "s":
+        delta = timedelta(seconds=amount)
+    elif unit == "m":
+        delta = timedelta(days=30 * amount)
+    elif unit == "h":
+        delta = timedelta(hours=amount)
+    elif unit == "d":
+        delta = timedelta(days=amount)
+    elif unit == "w":
+        delta = timedelta(weeks=amount)
+    elif unit == "y":
+        delta = timedelta(days=365 * amount)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported context_length unit.")
+    return datetime.now(timezone.utc) - delta
+
+
+def _score_messages(query: str, candidates: list[tuple[dict[str, Any], datetime]]) -> list[tuple[float, datetime, dict[str, Any]]]:
+    query_vector = _vectorize(query)
+    scored: list[tuple[float, datetime, dict[str, Any]]] = []
+    for message, timestamp in candidates:
+        text = f"{message.get('role', '')} {message.get('content', '')}"
+        score = _cosine_similarity(query_vector, _vectorize(text))
+        scored.append((score, timestamp, message))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top = scored[:4]
+    top.sort(key=lambda item: item[1])
+    return top
+
+
 # Request model for syncing messages
 class MessageSyncRequest(BaseModel):
-    messages: str  # Should be a JSON stringified list of message dicts
+    messages: list[dict[str, Any]] | str  # Accept raw list or JSON string
 
 # POST endpoint to sync message history for the current model
 @app.post("/sync_messages")
@@ -562,9 +717,15 @@ def sync_messages(req: MessageSyncRequest, user_id: str = Depends(verify_token))
     if not row:
         raise HTTPException(status_code=404, detail="No current model set.")
     model_name = row[0]
-    cursor.execute("UPDATE models SET messages = ? WHERE email = ? AND model_name = ?", (req.messages, user_id, model_name))
+    incoming = _coerce_message_list(req.messages)
+    normalized, _ = _normalize_messages(incoming)
+    serialized = _serialize_messages(normalized)
+    cursor.execute(
+        "UPDATE models SET messages = ? WHERE email = ? AND model_name = ?",
+        (serialized, user_id, model_name),
+    )
     conn.commit()
-    return {"status": "Messages synced", "messages": req.messages}
+    return {"status": "Messages synced", "messages": serialized}
 
 # GET endpoint to retrieve the current model's messages
 @app.get("/sync_messages")
@@ -579,6 +740,73 @@ def get_synced_messages(user_id: str = Depends(verify_token)):
     if not model:
         raise HTTPException(status_code=404, detail="Model data missing.")
     return {"messages": model[0]}
+
+
+class ContextRequest(BaseModel):
+    context_length: str
+    model_name: str = Field(alias="Model")
+    user_message: str
+
+    class Config:
+        allow_population_by_field_name = True
+
+
+# Allow both `/get_context` and `/get_context/`
+@app.post("/get_context")
+@app.post("/get_context/")
+def get_context(req: ContextRequest, user_id: str = Depends(verify_token)):
+    model_name = req.model_name
+    cursor.execute(
+        "SELECT messages FROM models WHERE email = ? AND model_name = ?",
+        (user_id, model_name),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return {
+            "model": model_name,
+            "context_length": req.context_length,
+            "messages": [],
+        }
+
+    stored_messages = _deserialize_stored_messages(row[0])
+    normalized_messages, changed = _normalize_messages(stored_messages)
+    if changed:
+        serialized = _serialize_messages(normalized_messages)
+        cursor.execute(
+            "UPDATE models SET messages = ? WHERE email = ? AND model_name = ?",
+            (serialized, user_id, model_name),
+        )
+        conn.commit()
+
+    cutoff = _context_cutoff(req.context_length)
+    candidates: list[tuple[dict[str, Any], datetime]] = []
+    for message in normalized_messages:
+        timestamp = _parse_timestamp(message.get("timestamp"))
+        if not timestamp:
+            continue
+        if timestamp >= cutoff:
+            candidates.append((message, timestamp.astimezone(timezone.utc)))
+
+    if not candidates:
+        return {
+            "model": model_name,
+            "context_length": req.context_length,
+            "messages": [],
+        }
+
+    ranked = _score_messages(req.user_message, candidates)
+    relevant_messages = []
+    for score, timestamp, message in ranked:
+        enriched = dict(message)
+        enriched["similarity"] = round(score, 4)
+        enriched["timestamp"] = timestamp.isoformat()
+        relevant_messages.append(enriched)
+
+    return {
+        "model": model_name,
+        "context_length": req.context_length,
+        "messages": relevant_messages,
+    }
 
 
 # --- Extension Management Endpoints ---
