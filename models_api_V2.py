@@ -925,6 +925,8 @@ def call_device(req: CallRequest, user_id: str = Depends(verify_token)):
                     "call_token": task_state["owner_call_token"],
                     "device_type": owner["device_type"],
                 }
+        if task_state["summary"]:
+            response["summary"] = task_state["summary"]
 
     conn.commit()
     return response
@@ -950,6 +952,16 @@ def call_good(req: CallGoodRequest, user_id: str = Depends(verify_token)):
             response["expect_updates"] = True
             if task_state["running_tool"]:
                 response["tool"] = task_state["running_tool"]
+            if task_state["owner_call_token"]:
+                owner = _get_call_device(user_id, task_state["owner_call_token"])
+                if owner:
+                    response["task_owner"] = {
+                        "device_name": owner["device_name"],
+                        "call_token": task_state["owner_call_token"],
+                        "device_type": owner["device_type"],
+                    }
+            if task_state["summary"]:
+                response["summary"] = task_state["summary"]
         conn.commit()
         return response
 
@@ -961,6 +973,20 @@ def call_good(req: CallGoodRequest, user_id: str = Depends(verify_token)):
         response["Call_Token"] = session["call_token"]
     else:
         response["message"] = "No active call for this account."
+    if task_state["status"] == "running":
+        response["expect_updates"] = True
+        if task_state["running_tool"]:
+            response["tool"] = task_state["running_tool"]
+        if task_state["owner_call_token"]:
+            owner = _get_call_device(user_id, task_state["owner_call_token"])
+            if owner:
+                response["task_owner"] = {
+                    "device_name": owner["device_name"],
+                    "call_token": task_state["owner_call_token"],
+                    "device_type": owner["device_type"],
+                }
+        if task_state["summary"]:
+            response["summary"] = task_state["summary"]
     return response
 
 
