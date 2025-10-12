@@ -8,7 +8,7 @@ import re
 import uuid, sqlite3
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 import bcrypt
 import jwt
 import time
@@ -139,6 +139,38 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS extensions (
     extension_code TEXT,
     PRIMARY KEY (email, command_name)
 )""")
+cursor.execute("""CREATE TABLE IF NOT EXISTS calling_devices (
+    email TEXT,
+    call_token TEXT,
+    device_name TEXT,
+    device_type TEXT,
+    created_at TEXT,
+    updated_at TEXT,
+    last_seen_at TEXT,
+    is_banned INTEGER DEFAULT 0,
+    banned_at TEXT,
+    ban_reason TEXT,
+    PRIMARY KEY (email, call_token)
+)""")
+cursor.execute("""CREATE TABLE IF NOT EXISTS call_sessions (
+    email TEXT PRIMARY KEY,
+    call_token TEXT,
+    device_name TEXT,
+    device_type TEXT,
+    started_at TEXT,
+    last_ping_at TEXT
+)""")
+cursor.execute("""CREATE TABLE IF NOT EXISTS call_task_state (
+    email TEXT PRIMARY KEY,
+    status TEXT,
+    running_tool TEXT,
+    summary TEXT,
+    updated_at TEXT,
+    owner_call_token TEXT
+)""")
+cursor.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_calling_devices_name
+    ON calling_devices(email, device_name)
+""")
 conn.commit()
 
 # Models
@@ -191,6 +223,40 @@ class DeviceRenameRequest(BaseModel):
     device_name: str
 
 
+class CallDeviceRegistration(BaseModel):
+    device_name: str
+    call_token: str
+    device_type: str = "unknown"
+
+
+class CallDeviceRename(BaseModel):
+    call_token: str
+    device_name: str
+
+
+class CallDeviceBanRequest(BaseModel):
+    call_token: str
+    reason: str | None = None
+
+
+class CallRequest(BaseModel):
+    device_name: str
+    call_token: str
+    device_type: str
+
+
+class CallGoodRequest(BaseModel):
+    call_token: str
+
+
+class TaskEventRequest(BaseModel):
+    event: Literal["started", "update", "completed", "transferred", "cleared"]
+    call_token: str | None = None
+    target_call_token: str | None = None
+    running_tool: str | None = None
+    summary: str | None = None
+
+
 class VoiceRegistration(BaseModel):
     name: str
     voice_id: str
@@ -203,6 +269,163 @@ class VoiceRegistration(BaseModel):
 class VoiceDeleteRequest(BaseModel):
     name: str | None = None
     delete_all: bool = False
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _get_call_device(user_id: str, call_token: str) -> dict[str, Any] | None:
+    cursor.execute(
+        """SELECT device_name, device_type, created_at, updated_at, last_seen_at,
+                  is_banned, banned_at, ban_reason
+           FROM calling_devices
+           WHERE email = ? AND call_token = ?""",
+        (user_id, call_token),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "device_name": row[0],
+        "device_type": row[1],
+        "created_at": row[2],
+        "updated_at": row[3],
+        "last_seen_at": row[4],
+        "is_banned": bool(row[5]),
+        "banned_at": row[6],
+        "ban_reason": row[7],
+    }
+
+
+def _ensure_device_name_available(user_id: str, device_name: str, exclude_token: str | None = None) -> bool:
+    device_name = device_name.strip()
+    if not device_name:
+        raise HTTPException(status_code=400, detail="Device name cannot be empty.")
+    params: list[Any] = [user_id, device_name]
+    sql = "SELECT call_token FROM calling_devices WHERE email = ? AND device_name = ?"
+    if exclude_token:
+        sql += " AND call_token != ?"
+        params.append(exclude_token)
+    cursor.execute(sql, tuple(params))
+    return cursor.fetchone() is None
+
+
+def _touch_call_device(user_id: str, call_token: str) -> None:
+    timestamp = _now_iso()
+    cursor.execute(
+        """UPDATE calling_devices
+           SET last_seen_at = ?, updated_at = ?
+           WHERE email = ? AND call_token = ?""",
+        (timestamp, timestamp, user_id, call_token),
+    )
+
+
+def _get_task_state(user_id: str) -> dict[str, Any]:
+    cursor.execute(
+        """SELECT status, running_tool, summary, owner_call_token
+           FROM call_task_state
+           WHERE email = ?""",
+        (user_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return {"status": "idle", "running_tool": None, "summary": None, "owner_call_token": None}
+    return {
+        "status": row[0] or "idle",
+        "running_tool": row[1],
+        "summary": row[2],
+        "owner_call_token": row[3],
+    }
+
+
+def _set_task_state(user_id: str, status: str, *, running_tool: str | None, summary: str | None, owner_call_token: str | None) -> None:
+    timestamp = _now_iso()
+    cursor.execute(
+        """INSERT INTO call_task_state (email, status, running_tool, summary, updated_at, owner_call_token)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(email) DO UPDATE SET
+               status = excluded.status,
+               running_tool = excluded.running_tool,
+               summary = excluded.summary,
+               updated_at = excluded.updated_at,
+               owner_call_token = excluded.owner_call_token""",
+        (user_id, status, running_tool, summary, timestamp, owner_call_token),
+    )
+
+
+def _clear_call_session(user_id: str, call_token: str | None = None) -> None:
+    if call_token:
+        cursor.execute(
+            "DELETE FROM call_sessions WHERE email = ? AND call_token = ?",
+            (user_id, call_token),
+        )
+    else:
+        cursor.execute(
+            "DELETE FROM call_sessions WHERE email = ?",
+            (user_id,),
+        )
+
+
+def _get_call_session(user_id: str) -> dict[str, Any] | None:
+    cursor.execute(
+        """SELECT call_token, device_name, device_type, started_at, last_ping_at
+           FROM call_sessions
+           WHERE email = ?""",
+        (user_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "call_token": row[0],
+        "device_name": row[1],
+        "device_type": row[2],
+        "started_at": row[3],
+        "last_ping_at": row[4],
+    }
+
+
+def _set_call_session(user_id: str, call_token: str, device_name: str, device_type: str) -> None:
+    timestamp = _now_iso()
+    cursor.execute(
+        """INSERT INTO call_sessions (email, call_token, device_name, device_type, started_at, last_ping_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(email) DO UPDATE SET
+               call_token = excluded.call_token,
+               device_name = excluded.device_name,
+               device_type = excluded.device_type,
+               started_at = excluded.started_at,
+               last_ping_at = excluded.last_ping_at""",
+        (user_id, call_token, device_name, device_type, timestamp, timestamp),
+    )
+
+
+def _update_call_session_ping(user_id: str) -> None:
+    timestamp = _now_iso()
+    cursor.execute(
+        "UPDATE call_sessions SET last_ping_at = ? WHERE email = ?",
+        (timestamp, user_id),
+    )
+
+
+def _get_current_model_messages(user_id: str) -> list[Any]:
+    cursor.execute("SELECT model_name FROM current_model WHERE email = ?", (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        return []
+    model_name = row[0]
+    cursor.execute(
+        "SELECT messages FROM models WHERE email = ? AND model_name = ?",
+        (user_id, model_name),
+    )
+    messages_row = cursor.fetchone()
+    if not messages_row or messages_row[0] is None:
+        return []
+    try:
+        return json.loads(messages_row[0])
+    except (TypeError, json.JSONDecodeError):
+        return []
 
 
 def create_refresh_token(email: str):
@@ -527,6 +750,266 @@ def get_registered_devices(user_id: str = Depends(verify_token)):
     if device_ports:
         response["device_ports"] = device_ports
     return response
+
+
+@app.post("/call/add_device")
+def call_add_device(req: CallDeviceRegistration, user_id: str = Depends(verify_token)):
+    device_name = req.device_name.strip()
+    call_token = req.call_token.strip()
+    if not call_token:
+        raise HTTPException(status_code=400, detail="Call token is required.")
+    if not _ensure_device_name_available(user_id, device_name, exclude_token=call_token):
+        return {"status": "received", "Add_device_status": "Device_name_taken"}
+
+    timestamp = _now_iso()
+    existing = _get_call_device(user_id, call_token)
+    if existing:
+        cursor.execute(
+            """UPDATE calling_devices
+               SET device_name = ?, device_type = ?, updated_at = ?, last_seen_at = ?
+               WHERE email = ? AND call_token = ?""",
+            (device_name, req.device_type, timestamp, timestamp, user_id, call_token),
+        )
+        conn.commit()
+        return {"status": "received", "Add_device_status": "device_added", "existing": True}
+
+    cursor.execute(
+        """INSERT INTO calling_devices
+           (email, call_token, device_name, device_type, created_at, updated_at, last_seen_at, is_banned, banned_at, ban_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)""",
+        (user_id, call_token, device_name, req.device_type, timestamp, timestamp, timestamp),
+    )
+    conn.commit()
+    return {"status": "received", "Add_device_status": "device_added", "existing": False}
+
+
+@app.get("/call/devices")
+def call_list_devices(user_id: str = Depends(verify_token)):
+    cursor.execute(
+        """SELECT call_token, device_name, device_type, created_at, updated_at, last_seen_at,
+                  is_banned, banned_at, ban_reason
+           FROM calling_devices
+           WHERE email = ?
+           ORDER BY created_at ASC""",
+        (user_id,),
+    )
+    devices = []
+    for row in cursor.fetchall():
+        devices.append(
+            {
+                "call_token": row[0],
+                "device_name": row[1],
+                "device_type": row[2],
+                "created_at": row[3],
+                "updated_at": row[4],
+                "last_seen_at": row[5],
+                "is_banned": bool(row[6]),
+                "banned_at": row[7],
+                "ban_reason": row[8],
+            }
+        )
+    return {"devices": devices}
+
+
+@app.post("/call/edit_device_name")
+def call_edit_device(req: CallDeviceRename, user_id: str = Depends(verify_token)):
+    device = _get_call_device(user_id, req.call_token)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not registered.")
+    if not _ensure_device_name_available(user_id, req.device_name.strip(), exclude_token=req.call_token):
+        raise HTTPException(status_code=409, detail="Device name already in use.")
+    timestamp = _now_iso()
+    cursor.execute(
+        """UPDATE calling_devices
+           SET device_name = ?, updated_at = ?
+           WHERE email = ? AND call_token = ?""",
+        (req.device_name.strip(), timestamp, user_id, req.call_token),
+    )
+    conn.commit()
+    return {"status": "received", "Rename_status": "device_renamed"}
+
+
+@app.post("/call/ban_device")
+def call_ban_device(req: CallDeviceBanRequest, user_id: str = Depends(verify_token)):
+    device = _get_call_device(user_id, req.call_token)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not registered.")
+    if device["is_banned"]:
+        return {"status": "received", "Ban_status": "already_banned"}
+    timestamp = _now_iso()
+    cursor.execute(
+        """UPDATE calling_devices
+           SET is_banned = 1, banned_at = ?, ban_reason = ?, updated_at = ?
+           WHERE email = ? AND call_token = ?""",
+        (timestamp, req.reason, timestamp, user_id, req.call_token),
+    )
+    _clear_call_session(user_id, req.call_token)
+    task_state = _get_task_state(user_id)
+    if task_state["owner_call_token"] == req.call_token:
+        _set_task_state(user_id, "idle", running_tool=None, summary=None, owner_call_token=None)
+    conn.commit()
+    return {"status": "received", "Ban_status": "device_banned"}
+
+
+@app.post("/call/unban_device")
+def call_unban_device(req: CallDeviceBanRequest, user_id: str = Depends(verify_token)):
+    device = _get_call_device(user_id, req.call_token)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not registered.")
+    if not device["is_banned"]:
+        return {"status": "received", "Ban_status": "not_banned"}
+    timestamp = _now_iso()
+    cursor.execute(
+        """UPDATE calling_devices
+           SET is_banned = 0, banned_at = NULL, ban_reason = NULL, updated_at = ?
+           WHERE email = ? AND call_token = ?""",
+        (timestamp, user_id, req.call_token),
+    )
+    conn.commit()
+    return {"status": "received", "Ban_status": "device_unbanned"}
+
+
+@app.post("/call")
+def call_device(req: CallRequest, user_id: str = Depends(verify_token)):
+    call_token = req.call_token.strip()
+    device = _get_call_device(user_id, call_token)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device must be registered before initiating a call.")
+    if device["is_banned"]:
+        return {"status": "received", "Call_Status": "locked_out", "message": "Device locked out of account."}
+
+    new_name = req.device_name.strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Device name is required.")
+
+    timestamp = _now_iso()
+    if device["device_name"] != new_name:
+        if not _ensure_device_name_available(user_id, new_name, exclude_token=call_token):
+            return {"status": "received", "Call_Status": "name_taken", "message": "Device name already in use."}
+        cursor.execute(
+            """UPDATE calling_devices
+               SET device_name = ?, updated_at = ?
+               WHERE email = ? AND call_token = ?""",
+            (new_name, timestamp, user_id, call_token),
+        )
+        device["device_name"] = new_name
+
+    if device["device_type"] != req.device_type:
+        cursor.execute(
+            """UPDATE calling_devices
+               SET device_type = ?, updated_at = ?
+               WHERE email = ? AND call_token = ?""",
+            (req.device_type, timestamp, user_id, call_token),
+        )
+        device["device_type"] = req.device_type
+
+    _touch_call_device(user_id, call_token)
+    _set_call_session(user_id, call_token, device["device_name"], device["device_type"])
+
+    messages = _get_current_model_messages(user_id)
+    task_state = _get_task_state(user_id)
+    response: dict[str, Any] = {
+        "status": "received",
+        "Call_Status": "yup",
+        "Current_messages": messages,
+    }
+    if task_state["status"] == "running":
+        response["expect_updates"] = True
+        if task_state["running_tool"]:
+            response["tool"] = task_state["running_tool"]
+        if task_state["owner_call_token"]:
+            owner = _get_call_device(user_id, task_state["owner_call_token"])
+            if owner:
+                response["task_owner"] = {
+                    "device_name": owner["device_name"],
+                    "call_token": task_state["owner_call_token"],
+                    "device_type": owner["device_type"],
+                }
+
+    conn.commit()
+    return response
+
+
+@app.post("/call/good")
+def call_good(req: CallGoodRequest, user_id: str = Depends(verify_token)):
+    call_token = req.call_token.strip()
+    device = _get_call_device(user_id, call_token)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device must be registered before using call_good.")
+    if device["is_banned"]:
+        return {"status": "received", "Call_Status": "locked_out", "message": "Device locked out of account."}
+
+    _touch_call_device(user_id, call_token)
+    session = _get_call_session(user_id)
+    task_state = _get_task_state(user_id)
+
+    if session and session["call_token"] == call_token:
+        _update_call_session_ping(user_id)
+        response: dict[str, Any] = {"status": "received", "Call_Status": "bueno"}
+        if task_state["status"] == "running":
+            response["expect_updates"] = True
+            if task_state["running_tool"]:
+                response["tool"] = task_state["running_tool"]
+        conn.commit()
+        return response
+
+    conn.commit()
+    response: dict[str, Any] = {"status": "received", "Call_Status": "no_bueno"}
+    if session:
+        response["you_can_ask_i_guess"] = session["device_name"]
+        response["Device_Type"] = session["device_type"]
+        response["Call_Token"] = session["call_token"]
+    else:
+        response["message"] = "No active call for this account."
+    return response
+
+
+@app.post("/call/task_event")
+def call_task_event(req: TaskEventRequest, user_id: str = Depends(verify_token)):
+    event = req.event
+    if event == "started":
+        if not req.call_token:
+            raise HTTPException(status_code=400, detail="call_token is required for 'started' events.")
+        _set_task_state(
+            user_id,
+            "running",
+            running_tool=req.running_tool,
+            summary=req.summary,
+            owner_call_token=req.call_token,
+        )
+    elif event == "update":
+        state = _get_task_state(user_id)
+        owner = req.call_token or state["owner_call_token"]
+        _set_task_state(
+            user_id,
+            "running",
+            running_tool=req.running_tool or state["running_tool"],
+            summary=req.summary or state["summary"],
+            owner_call_token=owner,
+        )
+    elif event == "transferred":
+        if not req.target_call_token:
+            raise HTTPException(status_code=400, detail="target_call_token is required for 'transferred' events.")
+        _set_task_state(
+            user_id,
+            "running",
+            running_tool=req.running_tool,
+            summary=req.summary,
+            owner_call_token=req.target_call_token,
+        )
+    elif event in {"completed", "cleared"}:
+        _set_task_state(
+            user_id,
+            "idle",
+            running_tool=None,
+            summary=req.summary,
+            owner_call_token=None,
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported event type.")
+
+    conn.commit()
+    return {"status": "received", "event": event}
 
 
 
