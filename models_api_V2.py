@@ -250,6 +250,10 @@ class CallDeviceBanRequest(BaseModel):
     reason: str | None = None
 
 
+class CallDeviceDeleteRequest(BaseModel):
+    call_token: str
+
+
 class CallRequest(BaseModel):
     device_name: str
     call_token: str
@@ -902,6 +906,39 @@ def call_unban_device(req: CallDeviceBanRequest, user_id: str = Depends(verify_t
     )
     conn.commit()
     return {"status": "received", "Ban_status": "device_unbanned"}
+
+
+@app.post("/call/remove_device")
+def call_remove_device(req: CallDeviceDeleteRequest, user_id: str = Depends(verify_token)):
+    device = _get_call_device(user_id, req.call_token)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not registered.")
+
+    engine_token = device.get("engine_device_token")
+    cursor.execute(
+        "DELETE FROM calling_devices WHERE email = ? AND call_token = ?",
+        (user_id, req.call_token),
+    )
+    _clear_call_session(user_id, req.call_token)
+
+    task_state = _get_task_state(user_id)
+    if engine_token and engine_token == task_state.get("owner_device_token"):
+        _set_task_state(
+            user_id,
+            "idle",
+            running_tool=None,
+            summary=None,
+            owner_device_token=None,
+        )
+
+    if engine_token:
+        cursor.execute(
+            "DELETE FROM engine_ports WHERE email = ? AND device_token = ?",
+            (user_id, engine_token),
+        )
+
+    conn.commit()
+    return {"status": "received", "Remove_status": "device_removed"}
 
 
 @app.post("/call")
