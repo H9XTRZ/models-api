@@ -262,10 +262,9 @@ class CallGoodRequest(BaseModel):
 
 class TaskEventRequest(BaseModel):
     event: Literal["started", "completed"]
-    call_token: str
+    engine_device_token: str
     running_tool: str | None = None
     summary: str | None = None
-    engine_device_token: str | None = None
 
 
 class VoiceRegistration(BaseModel):
@@ -335,20 +334,19 @@ def _touch_call_device(user_id: str, call_token: str) -> None:
 
 def _get_task_state(user_id: str) -> dict[str, Any]:
     cursor.execute(
-        """SELECT status, running_tool, summary, owner_call_token, owner_device_token
+        """SELECT status, running_tool, summary, owner_device_token
            FROM call_task_state
            WHERE email = ?""",
         (user_id,),
     )
     row = cursor.fetchone()
     if not row:
-        return {"status": "idle", "running_tool": None, "summary": None, "owner_call_token": None, "owner_device_token": None}
+        return {"status": "idle", "running_tool": None, "summary": None, "owner_device_token": None}
     return {
         "status": row[0] or "idle",
         "running_tool": row[1],
         "summary": row[2],
-        "owner_call_token": row[3],
-        "owner_device_token": row[4],
+        "owner_device_token": row[3],
     }
 
 
@@ -358,21 +356,20 @@ def _set_task_state(
     *,
     running_tool: str | None,
     summary: str | None,
-    owner_call_token: str | None,
     owner_device_token: str | None,
 ) -> None:
     timestamp = _now_iso()
     cursor.execute(
         """INSERT INTO call_task_state (email, status, running_tool, summary, updated_at, owner_call_token, owner_device_token)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+           VALUES (?, ?, ?, ?, ?, NULL, ?)
            ON CONFLICT(email) DO UPDATE SET
                status = excluded.status,
                running_tool = excluded.running_tool,
                summary = excluded.summary,
                updated_at = excluded.updated_at,
-               owner_call_token = excluded.owner_call_token,
+               owner_call_token = NULL,
                owner_device_token = excluded.owner_device_token""",
-        (user_id, status, running_tool, summary, timestamp, owner_call_token, owner_device_token),
+        (user_id, status, running_tool, summary, timestamp, owner_device_token),
     )
 
 
@@ -448,6 +445,19 @@ def _get_current_model_messages(user_id: str) -> list[Any]:
         return json.loads(messages_row[0])
     except (TypeError, json.JSONDecodeError):
         return []
+
+
+def _get_engine_port_url(user_id: str, device_token: str | None) -> str | None:
+    if not device_token:
+        return None
+    cursor.execute(
+        "SELECT tunnel_url FROM engine_ports WHERE email = ? AND device_token = ?",
+        (user_id, device_token),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return row[0]
 
 
 def create_refresh_token(email: str):
@@ -870,8 +880,8 @@ def call_ban_device(req: CallDeviceBanRequest, user_id: str = Depends(verify_tok
     )
     _clear_call_session(user_id, req.call_token)
     task_state = _get_task_state(user_id)
-    if task_state["owner_call_token"] == req.call_token:
-        _set_task_state(user_id, "idle", running_tool=None, summary=None, owner_call_token=None, owner_device_token=None)
+    if task_state["owner_device_token"] and task_state["owner_device_token"] == device.get("engine_device_token"):
+        _set_task_state(user_id, "idle", running_tool=None, summary=None, owner_device_token=None)
     conn.commit()
     return {"status": "received", "Ban_status": "device_banned"}
 
@@ -942,16 +952,12 @@ def call_device(req: CallRequest, user_id: str = Depends(verify_token)):
         response["expect_updates"] = True
         if task_state["running_tool"]:
             response["tool"] = task_state["running_tool"]
-        if task_state["owner_call_token"]:
-            owner = _get_call_device(user_id, task_state["owner_call_token"])
-            device_token = task_state.get("owner_device_token") or (owner.get("engine_device_token") if owner else None)
-            if owner or device_token:
-                response["task_owner"] = {
-                    "device_name": owner["device_name"] if owner else None,
-                    "call_token": task_state["owner_call_token"],
-                    "device_type": owner["device_type"] if owner else None,
-                    "device_token": device_token,
-                }
+        engine_token = task_state.get("owner_device_token")
+        if engine_token:
+            response["engine_device_token"] = engine_token
+            port_url = _get_engine_port_url(user_id, engine_token)
+            if port_url:
+                response["engine_port"] = port_url
         if task_state["summary"]:
             response["summary"] = task_state["summary"]
 
@@ -979,16 +985,12 @@ def call_good(req: CallGoodRequest, user_id: str = Depends(verify_token)):
             response["expect_updates"] = True
             if task_state["running_tool"]:
                 response["tool"] = task_state["running_tool"]
-            if task_state["owner_call_token"]:
-                owner = _get_call_device(user_id, task_state["owner_call_token"])
-                device_token = task_state.get("owner_device_token") or (owner.get("engine_device_token") if owner else None)
-                if owner or device_token:
-                    response["task_owner"] = {
-                        "device_name": owner["device_name"] if owner else None,
-                        "call_token": task_state["owner_call_token"],
-                        "device_type": owner["device_type"] if owner else None,
-                        "device_token": device_token,
-                    }
+            engine_token = task_state.get("owner_device_token")
+            if engine_token:
+                response["engine_device_token"] = engine_token
+                port_url = _get_engine_port_url(user_id, engine_token)
+                if port_url:
+                    response["engine_port"] = port_url
             if task_state["summary"]:
                 response["summary"] = task_state["summary"]
         conn.commit()
@@ -1006,16 +1008,12 @@ def call_good(req: CallGoodRequest, user_id: str = Depends(verify_token)):
         response["expect_updates"] = True
         if task_state["running_tool"]:
             response["tool"] = task_state["running_tool"]
-        if task_state["owner_call_token"]:
-            owner = _get_call_device(user_id, task_state["owner_call_token"])
-            device_token = task_state.get("owner_device_token") or (owner.get("engine_device_token") if owner else None)
-            if owner or device_token:
-                response["task_owner"] = {
-                    "device_name": owner["device_name"] if owner else None,
-                    "call_token": task_state["owner_call_token"],
-                    "device_type": owner["device_type"] if owner else None,
-                    "device_token": device_token,
-                }
+        engine_token = task_state.get("owner_device_token")
+        if engine_token:
+            response["engine_device_token"] = engine_token
+            port_url = _get_engine_port_url(user_id, engine_token)
+            if port_url:
+                response["engine_port"] = port_url
         if task_state["summary"]:
             response["summary"] = task_state["summary"]
     return response
@@ -1024,42 +1022,41 @@ def call_good(req: CallGoodRequest, user_id: str = Depends(verify_token)):
 @app.post("/call/task_event")
 def call_task_event(req: TaskEventRequest, user_id: str = Depends(verify_token)):
     event = req.event
-    call_token = req.call_token.strip()
-    if not call_token:
-        raise HTTPException(status_code=400, detail="call_token is required.")
+    engine_device_token = req.engine_device_token.strip()
+    if not engine_device_token:
+        raise HTTPException(status_code=400, detail="engine_device_token is required.")
+
+    cursor.execute(
+        "SELECT 1 FROM devices WHERE email = ? AND device_token = ?",
+        (user_id, engine_device_token),
+    )
+    if not cursor.fetchone():
+        raise HTTPException(status_code=404, detail="Engine device must be registered before reporting task events.")
+
     running_tool = (req.running_tool or "").strip() or None
     summary = (req.summary or "").strip() or None
+
     if event == "started":
-        device = _get_call_device(user_id, call_token)
-        if not device:
-            raise HTTPException(status_code=404, detail="Device must register before reporting task events.")
-        engine_device_token = (req.engine_device_token or "").strip() or device.get("engine_device_token")
-        if engine_device_token and not device.get("engine_device_token"):
-            timestamp = _now_iso()
-            cursor.execute(
-                """UPDATE calling_devices
-                   SET engine_device_token = ?, updated_at = ?, last_seen_at = ?
-                   WHERE email = ? AND call_token = ?""",
-                (engine_device_token, timestamp, timestamp, user_id, call_token),
-            )
         _set_task_state(
             user_id,
             "running",
             running_tool=running_tool,
             summary=summary,
-            owner_call_token=call_token,
             owner_device_token=engine_device_token,
         )
     elif event == "completed":
         state = _get_task_state(user_id)
-        if state["status"] == "running" and state["owner_call_token"] and state["owner_call_token"] != call_token:
+        if (
+            state["status"] == "running"
+            and state["owner_device_token"]
+            and state["owner_device_token"] != engine_device_token
+        ):
             raise HTTPException(status_code=409, detail="Task is owned by a different device.")
         _set_task_state(
             user_id,
             "idle",
             running_tool=None,
             summary=summary,
-            owner_call_token=None,
             owner_device_token=None,
         )
     else:
