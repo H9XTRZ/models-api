@@ -8,7 +8,7 @@ import re
 import uuid, sqlite3
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any, Literal, List
 import bcrypt
 import jwt
 import time
@@ -492,7 +492,8 @@ def login(req: LoginRequest):
         }
         token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
         cursor.execute("REPLACE INTO tokens (email, token) VALUES (?, ?)", (req.email, token))
-        cursor.execute("INSERT OR IGNORE INTO memories (email, memory) VALUES (?, '')", (req.email,))
+        empty_memories = json.dumps([])
+        cursor.execute("INSERT OR IGNORE INTO memories (email, memory) VALUES (?, ?)", (req.email, empty_memories))
         conn.commit()
         refresh_token = create_refresh_token(req.email)
         return {"token": token, "refresh_token": refresh_token}
@@ -527,25 +528,61 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+def _parse_memory_blob(memory_blob: str) -> List[str]:
+    """
+    Convert stored memory text (JSON list or legacy header format) into a list of strings.
+    """
+    if not memory_blob:
+        return []
+    blob = memory_blob.strip()
+    if not blob:
+        return []
+
+    try:
+        parsed = json.loads(blob)
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed if str(item).strip()]
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    header_separator = "----\n"
+    if header_separator in blob:
+        blob = blob.split(header_separator, 1)[1]
+
+    legacy_entries = []
+    for chunk in blob.split("*"):
+        entry = chunk.strip()
+        if entry:
+            legacy_entries.append(entry)
+
+    return legacy_entries
+
+def _serialize_memories(memories: List[str]) -> str:
+    """Serialize memory list to JSON for storage."""
+    return json.dumps(memories)
+
 @app.get("/memory")
 def get_memory(user_id: str = Depends(verify_token)):
     cursor.execute("SELECT memory FROM memories WHERE email = ?", (user_id,))
     mem_row = cursor.fetchone()
     print("📀 Opened memory database:")
-    return {"memory": "Availible memories. Each memory is seprated by '*' " + mem_row[0] if mem_row else ""}
+    if not mem_row or mem_row[0] is None:
+        return {"memory": []}
+    memories = _parse_memory_blob(mem_row[0])
+    return {"memory": memories}
 
 @app.post("/memory/update")
 def update_memory(req: MemoryUpdate, user_id: str = Depends(verify_token)):
     cursor.execute("SELECT memory FROM memories WHERE email = ?", (user_id,))
     existing = cursor.fetchone()
-    existing_memory = existing[0] if existing and existing[0] else ""
-    if not existing_memory.startswith("SYSTEM RESPONSE: You have entered the MEMORY DATABASE"):
-        header = "SYSTEM RESPONSE: Here are all the memories currently saved with the user.\nEach memory is separated by * — this marks the end of one and the start of another.\n----\n"
-    else:
-        header = ""
-    updated_memory = existing_memory + req.memory.strip() + "   *\n"
-    final_memory = header + updated_memory if not existing_memory else updated_memory
-    cursor.execute("UPDATE memories SET memory = ? WHERE email = ?", (final_memory, user_id))
+    existing_blob = existing[0] if existing and existing[0] else ""
+    memories = _parse_memory_blob(existing_blob)
+    new_memory = req.memory.strip()
+    if not new_memory:
+        raise HTTPException(status_code=400, detail="Memory content cannot be empty.")
+    memories.append(new_memory)
+    stored_value = _serialize_memories(memories)
+    cursor.execute("INSERT OR REPLACE INTO memories (email, memory) VALUES (?, ?)", (user_id, stored_value))
     conn.commit()
     return {"status": "Memory updated"}
 
