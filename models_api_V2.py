@@ -532,7 +532,7 @@ def get_memory(user_id: str = Depends(verify_token)):
     cursor.execute("SELECT memory FROM memories WHERE email = ?", (user_id,))
     mem_row = cursor.fetchone()
     print("📀 Opened memory database:")
-    return {"memory": "SYSTEM RESPONSE: You have entered the MEMORY DATABASE\nYou have entered the MEMORY DATABASE.\nHere are all the memories currently saved with the user.\nEach memory is separated by * — this marks the end of one and the start of another.\n----\n" + mem_row[0] if mem_row else ""}
+    return {"memory": "Availible memories. Each memory is seprated by '*' " + mem_row[0] if mem_row else ""}
 
 @app.post("/memory/update")
 def update_memory(req: MemoryUpdate, user_id: str = Depends(verify_token)):
