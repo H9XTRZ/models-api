@@ -1,7 +1,7 @@
 from cryptography.fernet import Fernet
 from fastapi import Request
 from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 import json
 import math
 import re
@@ -194,6 +194,20 @@ class LoginRequest(BaseModel):
 
 class MemoryUpdate(BaseModel):
     memory: str
+
+
+class MemoryQuery(BaseModel):
+    reference_text: str = Field(..., alias="reference", description="Reference text used to retrieve related memories.")
+
+    @root_validator(pre=True)
+    def _support_common_aliases(cls, values):
+        if "reference" not in values and "refrence" in values:
+            values["reference"] = values["refrence"]
+        return values
+
+    class Config:
+        allow_population_by_field_name = True
+        allow_population_by_alias = True
 
 class ModelCreate(BaseModel):
     model_name: str
@@ -561,15 +575,34 @@ def _serialize_memories(memories: List[str]) -> str:
     """Serialize memory list to JSON for storage."""
     return json.dumps(memories)
 
-@app.get("/memory")
-def get_memory(user_id: str = Depends(verify_token)):
+@app.post("/memory")
+def get_memory(req: MemoryQuery, user_id: str = Depends(verify_token)):
+    reference = req.reference_text.strip()
+    if not reference:
+        raise HTTPException(status_code=400, detail="Reference text cannot be empty.")
+
+    reference_vector = _vectorize(reference)
     cursor.execute("SELECT memory FROM memories WHERE email = ?", (user_id,))
     mem_row = cursor.fetchone()
     print("📀 Opened memory database:")
     if not mem_row or mem_row[0] is None:
-        return {"memory": []}
-    memories = _parse_memory_blob(mem_row[0])
-    return {"memory": memories}
+        return {"reference": reference, "memory": [], "relevant_memories": []}
+
+    memories = [entry.strip() for entry in _parse_memory_blob(mem_row[0])]
+    scored_memories = []
+    for entry in memories:
+        if not entry:
+            continue
+        score = _cosine_similarity(_vectorize(entry), reference_vector)
+        scored_memories.append((score, entry))
+
+    scored_memories.sort(key=lambda item: item[0], reverse=True)
+    top_matches = [entry for score, entry in scored_memories[:6]]
+    return {
+        "reference": reference,
+        "relevant_memories": top_matches,
+        "memory": top_matches,
+    }
 
 @app.post("/memory/update")
 def update_memory(req: MemoryUpdate, user_id: str = Depends(verify_token)):
