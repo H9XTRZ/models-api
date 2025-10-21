@@ -1401,8 +1401,7 @@ class ContextRequest(BaseModel):
     model_name: str = Field(alias="Model")
     user_message: str
 
-    class Config:
-        allow_population_by_field_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 # Allow both `/get_context` and `/get_context/`
