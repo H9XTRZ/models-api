@@ -1,7 +1,7 @@
 from cryptography.fernet import Fernet
 from fastapi import Request
 from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel, Field, root_validator
+from pydantic import BaseModel, Field, model_validator, ConfigDict
 import json
 import math
 import re
@@ -199,15 +199,15 @@ class MemoryUpdate(BaseModel):
 class MemoryQuery(BaseModel):
     reference_text: str = Field(..., alias="reference", description="Reference text used to retrieve related memories.")
 
-    @root_validator(pre=True)
-    def _support_common_aliases(cls, values):
-        if "reference" not in values and "refrence" in values:
-            values["reference"] = values["refrence"]
-        return values
+    model_config = ConfigDict(populate_by_name=True)
 
-    class Config:
-        allow_population_by_field_name = True
-        allow_population_by_alias = True
+    @model_validator(mode="before")
+    def _support_common_aliases(cls, values):
+        if isinstance(values, dict) and "reference" not in values and "refrence" in values:
+            new_values = dict(values)
+            new_values["reference"] = new_values["refrence"]
+            return new_values
+        return values
 
 class ModelCreate(BaseModel):
     model_name: str
