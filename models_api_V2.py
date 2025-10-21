@@ -597,7 +597,17 @@ def get_memory(req: MemoryQuery, user_id: str = Depends(verify_token)):
         scored_memories.append((score, entry))
 
     scored_memories.sort(key=lambda item: item[0], reverse=True)
-    top_matches = [entry for score, entry in scored_memories[:6]]
+
+    top_matches: list[str] = []
+    seen_entries: set[str] = set()
+    for score, entry in scored_memories:
+        normalized = entry.strip()
+        if not normalized or normalized in seen_entries:
+            continue
+        seen_entries.add(normalized)
+        top_matches.append(entry)
+        if len(top_matches) == 6:
+            break
     return {
         "reference": reference,
         "relevant_memories": top_matches,
