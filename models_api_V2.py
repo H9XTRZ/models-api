@@ -690,6 +690,48 @@ def get_models(user_id: str = Depends(verify_token)):
     models = [row[0] for row in cursor.fetchall()]
     return {"models": models}
 
+
+@app.get("/models/details")
+def get_model_details(user_id: str = Depends(verify_token)):
+    cursor.execute("SELECT model_name, init_prompt FROM models WHERE email = ?", (user_id,))
+    model_rows = cursor.fetchall()
+    if not model_rows:
+        return {"models": []}
+
+    cursor.execute(
+        "SELECT model_name, background, e1, e2, e3, e4, voice_id FROM model_themes WHERE email = ?",
+        (user_id,),
+    )
+    theme_rows = cursor.fetchall()
+    theme_index = {}
+    for model_name, background, e1, e2, e3, e4, voice_id in theme_rows:
+        theme = {
+            "background": background,
+            "e1": e1,
+            "e2": e2,
+            "e3": e3,
+            "e4": e4,
+        }
+        if voice_id:
+            theme["voice"] = voice_id
+            cursor.execute("SELECT name FROM voices WHERE voice_id = ?", (voice_id,))
+            voice_row = cursor.fetchone()
+            if voice_row and voice_row[0]:
+                theme["voice_name"] = voice_row[0]
+        theme_index[model_name] = theme
+
+    detailed_models = []
+    for model_name, init_prompt in model_rows:
+        detailed_models.append(
+            {
+                "model_name": model_name,
+                "init_prompt": init_prompt,
+                "theme": theme_index.get(model_name, None),
+            }
+        )
+
+    return {"models": detailed_models}
+
 # Get the current model state
 @app.get("/model_state")
 def get_model_state(user_id: str = Depends(verify_token)):
@@ -728,10 +770,6 @@ def get_model_state(user_id: str = Depends(verify_token)):
         voice_id = theme_row[5]
         if voice_id:
             theme["voice"] = voice_id
-            cursor.execute("SELECT name FROM voices WHERE voice_id = ?", (voice_id,))
-            voice_row = cursor.fetchone()
-            if voice_row and voice_row[0]:
-                theme["voice_name"] = voice_row[0]
 
     return {
         "model_name": model_name,
