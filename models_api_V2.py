@@ -728,6 +728,10 @@ def get_model_state(user_id: str = Depends(verify_token)):
         voice_id = theme_row[5]
         if voice_id:
             theme["voice"] = voice_id
+            cursor.execute("SELECT name FROM voices WHERE voice_id = ?", (voice_id,))
+            voice_row = cursor.fetchone()
+            if voice_row and voice_row[0]:
+                theme["voice_name"] = voice_row[0]
 
     return {
         "model_name": model_name,
